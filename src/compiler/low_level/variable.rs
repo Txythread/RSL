@@ -3,9 +3,30 @@ use crate::compiler::low_level::arch::arch::Arch;
 use crate::compiler::low_level::data_position::DataPosition;
 use crate::util::exit::{exit, ExitCode};
 
+#[derive(Clone)]
 pub struct Variable {
-    full_name: String,              // The full name of the variable (e.g. my_app:main.rsl:Main:loop1:myVar)
-    positions: Vec<DataPosition>    // All the positions the data position is currently stored in (might be in a register and on the stack at the same time)
+    pub full_name: String,              // The full name of the variable (e.g. my_app:main.rsl:Main:loop1:myVar)
+    pub positions: Vec<DataPosition>    // All the positions the data position is currently stored in (might be in a register and on the stack at the same time)
+}
+
+impl Variable {
+    pub fn new(full_name: String, positions: Vec<DataPosition>) -> Variable {
+        Variable { full_name, positions }
+    }
+
+    pub fn get_cheapest_position(&self) -> Option<DataPosition> {
+        let mut cheapest_position: Option<DataPosition> = None;
+
+        for position in &self.positions {
+            let position = position.clone();
+
+            if cheapest_position.is_none() || cheapest_position.clone().unwrap().cost() > position.cost() {
+                cheapest_position = Some(position);
+            }
+        }
+
+        cheapest_position
+    }
 }
 
 
