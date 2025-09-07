@@ -3,7 +3,7 @@ This is a helper struct to find the correct register usage later.
 Individual architectures might implement register/stack/heap selection handling themselves.
  */
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Hash, Eq)]
 pub struct Register{
     pub name: String,
     pub size_bits: u8,
@@ -35,7 +35,7 @@ impl Register{
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Hash, Eq)]
 pub enum RegisterSaver{
     Caller,     // caller-saved register
     Callee,     // callee-saved register
@@ -43,7 +43,7 @@ pub enum RegisterSaver{
     None,        // Scratch register
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Hash, Eq)]
 pub enum RegisterTag {
     Argument(/*(n-th argument) n=*/u8),
     GeneralPurpose,

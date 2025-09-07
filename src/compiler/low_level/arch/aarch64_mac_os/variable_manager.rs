@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use crate::compiler::low_level::arch::register::{Register, RegisterTag};
 use crate::compiler::low_level::data_position::DataPosition;
 use crate::compiler::low_level::macro_instruction::MacroInstruction;
@@ -9,7 +10,7 @@ pub fn find_place_for_variable(variable: &mut Variable, size: usize, other_varia
 
 pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Register>, instructions: Vec<MacroInstruction>, stack_offset: &mut usize) -> String{
     // Variables, where they should be, where they are and the inverse of the relevance they get to their target position (basically a bit like nice on unix-like systems)
-    let mut variable_info: Vec<(Variable, DataPosition, usize)> = Vec::new();
+    let mut variables_info: Vec<(Variable, DataPosition, usize)> = Vec::new();
 
     for variable in variables.clone(){
         let variable = variable.clone();
@@ -90,22 +91,166 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
         if target_position.is_none() || target_distance.is_none() {
             // Still add it somewhere since the data should still be preserved.
             if let Some(cheapest_position) = variable.get_cheapest_position(){
-                variable_info.push((variable.clone(), cheapest_position, usize::MAX));
+                variables_info.push((variable.clone(), cheapest_position, usize::MAX));
                 continue;
             }
             // If the last "if condition" did not return true, which is the case if the code here is getting executed,
             // the variable doesn't have an associated position, so it's a "stray".
             // Behaviour might be unexpected in other areas
+            continue;
         }
-        variable_info.push((variable.clone(), target_position.clone().unwrap(), target_distance.unwrap()));
+        variables_info.push((variable.clone(), target_position.clone().unwrap(), target_distance.unwrap()));
     }
 
     // Sort by distance (lowest first)
-    variable_info.sort_by(|a, b| a.clone().2.cmp(&b.clone().2));
+    variables_info.sort_by(|a, b| a.clone().2.cmp(&b.clone().2));
 
-    for var_info in variable_info{
+    #[cfg(test)]
+    for var_info in variables_info.clone(){
         println!("Name: {} \tCurrent Position: {:?} \tTarget Position: {:?} \tDistance: {}", var_info.0.full_name, var_info.0.positions.iter().nth(0), var_info.1, var_info.2)
     }
+
+    // The newly generated mapping from registers to variables.
+    // Basically variables_info but realistic (no registers being used multiple times)
+    let mut register_to_variable_map: HashMap<Register, Variable> = HashMap::new();
+
+    // All the variables that were in registers previously but don't fit anymore
+    // and are to be stored in the stack now.
+    let mut new_stack_items: Vec<Variable> = Vec::new();
+
+    // The registers that are not in register_to_variable_map yet,
+    // which means they can still be used to store variables to them.
+    let mut available_registers: Vec<Register> = registers.clone();
+
+    // Now, find the ideal realistic storage position for all variables
+    // This means trying to match the recommendation variable_info
+    // as best as possible (especially for all vars with a short distance)
+    // while not storing multiple variables on the same register.
+    for x in variables_info.clone().iter().enumerate(){
+        let mut var_info = x.1.clone();
+        let i = x.0;
+        // If the variable should be stored in a register, look if there's place for it left somewhere
+        // If not, let it live on the stack (or the heap for that matter) for now.
+        // The only way the variable info says it should be stored on the stack is if it has
+        // been stored on the stack previously, so there's no reason to even mark it for later.
+
+        if !matches!(var_info.1, DataPosition::Register(_)){
+            // This is not a register position,
+            // continue (reasoning above).
+            continue;
+        }
+
+        // Look if a specific register is requested or
+        // just some general-purpose register
+        if !var_info.1.is_general_purpose_register(){
+            // The requested register from the available_registers list if it's still available, None otherwise.
+            let register = available_registers.iter().find(|&x| x.name == var_info.1.register_name().unwrap());
+
+            if let Some(register) = register {
+                let register = register.clone();
+
+                // The register is still available.
+                // Remove it from the list and add it to register_to_var_map.
+
+                let position_in_available_registers = available_registers.iter().position(|x| x.clone() == register).unwrap();
+                available_registers.remove(position_in_available_registers);
+
+                register_to_variable_map.insert(register, var_info.0.clone());
+                continue;
+            }
+            // The requested register is not available, so look for a general purpose register instead.
+            // This is done by just continuing to the next step, which would handel normal general-purpose register requests.
+        }
+
+        // Either there was nothing but a general purpose register needed,
+        // or the real favourite failed (was overwritten by another reg)
+        // Find the least-used general purpose register and go with that
+        // or the stack (if there are no regs left).
+
+        // The remaining registers and how much damage using them would cause
+        // (0 being the most).
+        let mut register_cost_map: Vec<(Register, usize)> = Vec::new();
+
+        // Loop through all available general purpose registers.
+        for available_register in available_registers.clone().iter().filter(|&x| x.tags.iter().map(|x|x.clone()).collect::<Vec<RegisterTag>>().contains(&RegisterTag::GeneralPurpose)){
+            let available_register = available_register.clone();
+
+            // Now calculate the cost of using this register by going through all variable infos and looking if it's used somewhere.
+            // Usage found -> use distance as cost factor, if not use usize::MAX
+            let mut costs = usize::MAX;
+
+            for var_info in variables_info.clone().iter(){
+                let var_target = var_info.clone().1;
+
+                if let Some(target_name) = var_target.register_name(){
+                    if target_name != available_register.name { continue; }
+
+                    // Register ('available_register') is going to be used by this variable (or at least the variable wants to use this reg).
+                    let distance = var_info.clone().2;
+                    costs = distance;
+                }
+            }
+
+            register_cost_map.push((available_register.clone(), costs));
+        }
+
+        // Sort so the register with the smallest distance is at the top
+        register_cost_map.sort_by(|a, b| a.clone().1.cmp(&b.clone().1));
+
+        // Get the last register (with the biggest distance) from the register_cost_map.
+        // If it exists, use it, if not, there's no place left in the registers.
+        // This means the stack will need to handle that.
+        let most_cost_effective_reg = register_cost_map.last();
+
+        if let Some(most_cost_effective_reg) = most_cost_effective_reg {
+            // Remove the most_cost_effective_reg from the list of available registers as it's no longer going to be available
+            let reg_position_in_available_registers = available_registers.iter().position(|x| x.clone() == most_cost_effective_reg.clone().0).unwrap();
+            available_registers.remove(reg_position_in_available_registers);
+
+            // Add the variable to the mapping
+            _ = register_to_variable_map.insert(most_cost_effective_reg.clone().0, var_info.0.clone());
+
+            // Continue as the rest of the code is about handling the case that there is no space left in the registers.
+            continue;
+        }
+
+        // No place left in the registers, push to stack (if there is no alternative position (on the stack) already).
+
+        // Check if there is a stack location already.
+        if var_info.0.has_stack_position() {
+            // Stack position already exists, so delete all locations but the stack position.
+            // This is mainly to delete the register locations.
+            variables_info[i].0.remove_everything_except_stack_position();
+
+            // Continue as the rest of the code is there to push the variable to the stack as there's no other storage location and no space in the registers anymore.
+            continue;
+        }
+
+        // Push the data to the stack
+
+        // Generate the location and update the stack offset (since function start)
+        let location = DataPosition::StackOffset(*stack_offset);
+        *stack_offset += 4;
+
+        // Update the location in the  variable
+        var_info.0.positions = vec![location];
+
+        // Mark this for actually adding the push code later.
+        new_stack_items.push(var_info.clone().0);
+    }
+
+    #[cfg(test)]
+    {
+        for reg_and_var in register_to_variable_map {
+            println!("Register {}: \t{}", reg_and_var.0.name, reg_and_var.1.full_name);
+        }
+        for stack_data in new_stack_items{
+            println!("Adding {} to stack.", stack_data.full_name)
+        }
+    }
+
+
+    // TODO: Generate discrepancy, create code for creating assembly for pushing variables around
 
     "".to_string()
 }
@@ -138,17 +283,29 @@ mod tests{
 
         let mut var1 = Variable::new("var-1".to_string(), vec![]);
         let mut var2 = Variable::new("var-2".to_string(), vec![]);
+        let mut var3 = Variable::new("var-3".to_string(), vec![]);
 
-        let instructions: Vec<MacroInstruction> = vec![
+        let mut instructions: Vec<MacroInstruction> = vec![
             MacroInstruction::UseVariableAsArgument(var1.clone(), 0),
             MacroInstruction::UseVariableAsArgument(var2.clone(), 1),
             MacroInstruction::CallFunction("_malloc".to_string(), 2),
+            MacroInstruction::UseVariableAsArgument(var3.clone(), 0),
             MacroInstruction::DestroyVariable(var1.clone()),
             MacroInstruction::DestroyVariable(var2.clone()),
         ];
 
         variables.push(var1.clone());
         variables.push(var2.clone());
+        variables.push(var3.clone());
+
+        for i in 4..40{
+            let variable = Variable::new(format!("var-{}", i), vec![]);
+
+            instructions.insert(4, MacroInstruction::UseVariableAsArgument(variable.clone(), 0));
+
+            variables.push(variable.clone());
+        }
+
 
         _ = order_variable_locations(&mut variables, aarch64_regs, instructions, &mut stack_offset);
     }

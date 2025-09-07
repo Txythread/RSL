@@ -27,6 +27,48 @@ impl Variable {
 
         cheapest_position
     }
+
+    pub fn has_stack_position(&self) -> bool {
+        for position in &self.positions {
+            let position = position.clone();
+
+            match position{
+                DataPosition::StackOffset(_) | DataPosition::StackOffsetAt(_) => return true,
+                _ => continue
+            }
+        }
+        false
+    }
+
+    /// Remove every location but one location on the stack.
+    /// If there are multiple locations on the stack, the most direct one (without a non-immediate value referring to its location) will be chosen.
+    pub fn remove_everything_except_stack_position(&mut self) {
+        let mut stack_position: Option<DataPosition> = None;
+
+        for position in &self.positions {
+            let position = position.clone();
+
+            match position {
+                DataPosition::StackOffset(_) => {stack_position = Some(position);}
+                DataPosition::StackOffsetAt(offset) => {
+                    // Replace the currently selected stack position if the new position's cost is smaller than the currently selected stack position's or
+                    // the currently selected stack position is simply non-existent.
+                    if stack_position.is_none() || offset.cost() < stack_position.clone().unwrap().cost() {
+                        stack_position = Some(DataPosition::StackOffsetAt(offset));
+                    }
+                }
+                _ => continue
+            }
+        }
+
+        // Finally, replace all the positions with the stack position (if it exists)
+        // or nothing if it's non-existent.
+        if stack_position.is_some() {
+            self.positions = vec![stack_position.unwrap()];
+        }else{
+            self.positions = vec![];
+        }
+    }
 }
 
 
