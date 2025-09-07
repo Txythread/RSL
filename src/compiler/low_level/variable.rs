@@ -69,6 +69,32 @@ impl Variable {
             self.positions = vec![];
         }
     }
+
+    pub fn get_stack_offset(&self) -> Option<usize> {
+        if !self.has_stack_position() { return None }
+
+        let mut stack_position: Option<DataPosition> = None;
+
+        for position in &self.positions {
+            let position = position.clone();
+
+            match position {
+                DataPosition::StackOffset(_) => { stack_position = Some(position); }
+                DataPosition::StackOffsetAt(offset) => {
+                    // Replace the currently selected stack position if the new position's cost is smaller than the currently selected stack position's or
+                    // the currently selected stack position is simply non-existent.
+                    if stack_position.is_none() || offset.cost() < stack_position.clone().unwrap().cost() {
+                        stack_position = Some(DataPosition::StackOffsetAt(offset));
+                    }
+                }
+                _ => continue
+            }
+        }
+
+        if stack_position.is_none() { return None }
+
+        stack_position.unwrap().immediate_stack_offset()
+    }
 }
 
 

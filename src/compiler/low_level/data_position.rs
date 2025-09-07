@@ -55,4 +55,11 @@ impl DataPosition {
             DataPosition::Heap(pos, _) => { 2 + pos.cost() }
         }
     }
+
+    pub fn immediate_stack_offset(&self) -> Option<usize>{
+        match self {
+            DataPosition::StackOffset(offset) => { Some(*offset) }
+            _ => None,
+        }
+    }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::format;
 use crate::compiler::low_level::arch::register::{Register, RegisterTag};
 use crate::compiler::low_level::data_position::DataPosition;
 use crate::compiler::low_level::macro_instruction::MacroInstruction;
@@ -11,6 +12,9 @@ pub fn find_place_for_variable(variable: &mut Variable, size: usize, other_varia
 pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Register>, instructions: Vec<MacroInstruction>, stack_offset: &mut usize) -> String{
     // Variables, where they should be, where they are and the inverse of the relevance they get to their target position (basically a bit like nice on unix-like systems)
     let mut variables_info: Vec<(Variable, DataPosition, usize)> = Vec::new();
+
+    // The code that will be used to move the variables around
+    let mut code = String::new();
 
     for variable in variables.clone(){
         let variable = variable.clone();
@@ -226,11 +230,107 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
             continue;
         }
 
-        // Push the data to the stack
+        // Push the data to the stack.
 
-        // Generate the location and update the stack offset (since function start)
+        // Data that had no previous location but is now new at the stack does not need to be allocated,
+        // it just needs a reserved address, which it's already got,
+        // but it still needs to have its stack position stored in the variables variable
+
+        // Data is best stored in pairs, as this is more efficient on the aarch64 architecture.
+        // Keep info about one variable to be able to push in pairs where possible
+        // Store the variable (with its new location in the positions field) and the register it has been stored at previously
+        let mut pair_first_part: Option<(Variable, Register)> = None;
+
+        // Go through all the data from the stack
+        for stack_variable in new_stack_items.clone(){
+            // The variable as it's been in its previous state (with the old positions).
+            let original_variable = variables.iter().find(|&var| var.full_name == stack_variable.full_name);
+
+            if original_variable.is_none() { continue; }
+
+            let original_variable = original_variable.unwrap();
+
+            // If the original variable wasn't stored in a register, skip it (as explained above).
+            let least_costy_position = original_variable.get_cheapest_position();
+
+            if least_costy_position.is_none() { continue; }
+            let least_costy_position = least_costy_position.unwrap();
+            if !matches!(least_costy_position, DataPosition::Register(_)) {
+                // TODO: Update location in "variables"
+                continue;
+            }
+
+            let current_register = registers.iter().find(|&x|x.name == least_costy_position.register_name().unwrap());
+            if current_register.is_none() { panic!("Register {} not found though there's a value that claims to have been stored in it.", least_costy_position.register_name().unwrap())}
+            let current_register = current_register.unwrap();
+
+            // Try to make pairs as explained above
+            if pair_first_part.is_none() {
+                pair_first_part = Some((stack_variable.clone(), current_register.clone()));
+
+                // Continue as the rest of the code is for actually storing the pair.
+                continue;
+            }
+
+            // Store the pair if possible.
+            // Storing the pair is impossible if their expected storing positions are not immediately after each other.
+            // This could happen if a new value has been allocated in between.
+            // If there are 8B in between the storage positions of those two variables,
+            // they are after each other for sure -> store them as a pair
+            let storage_position_difference = (pair_first_part.clone().unwrap().0.get_stack_offset().unwrap() as isize) - stack_variable.get_stack_offset().unwrap() as isize;
+
+            // Also generate the register of the second part
+
+            {
+                let stack_offset1 = stack_variable.get_stack_offset().unwrap();
+                let reg_name1 = current_register.clone().name;
+                let stack_offset2 = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+                let reg_name2 = pair_first_part.clone().unwrap().1.name;
+
+                println!("Reg {} should be stored at {}. Reg {} should be stored at {}", reg_name1, stack_offset1, reg_name2, stack_offset2);
+            }
+            // Check difference as detailed above
+            if storage_position_difference == 8 {
+                // Store in order: second_pair_part, first_pair_part at the position of first_pair_part
+                let stack_offset = stack_variable.get_stack_offset().unwrap();
+                code += format!("stp\t{}, {}, [sp, #{}]\n", current_register.name, pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
+            }else if storage_position_difference == -8 {
+                // Store in reverse order
+                let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+                code += format!("stp\t{}, {}, [sp, #{}]\n", pair_first_part.clone().unwrap().1.name, current_register.name, stack_offset).as_str();
+            }else {
+                // Store pair_first_part
+                {
+                    let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+                    code += format!("str\t{}, [sp, #{}]", pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
+                }
+                // Store the second pair part
+                {
+                    let stack_offset = stack_variable.get_stack_offset().unwrap();
+                    code += format!("str\t{}, [sp, #{}]", current_register.name, stack_offset).as_str();
+                }
+            }
+
+            // Update the locations stored in the "variables" variable.
+            // Now that the data is stored in its new position, the old position can be forgotten
+            // without an issue.
+
+            // Do this for the current one first
+            {
+                let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
+                variables[position_in_variables].positions = stack_variable.positions.clone();
+            }
+
+            // Now the same for the first_pair_part
+            {
+                let position_in_variables = variables.iter().position(|x| x.clone().full_name == pair_first_part.clone().unwrap().0.full_name).unwrap();
+                variables[position_in_variables].positions = pair_first_part.clone().unwrap().0.positions.clone();
+            }
+        }
+
+        // Generate the location and update the stack offset (since function/stack frame start)
         let location = DataPosition::StackOffset(*stack_offset);
-        *stack_offset += 4;
+        *stack_offset += 8;
 
         // Update the location in the  variable
         var_info.0.positions = vec![location];
@@ -250,9 +350,13 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
     }
 
 
+
+    // Look which stack items need to be allocated.
+    // Stack items without
+
     // TODO: Generate discrepancy, create code for creating assembly for pushing variables around
 
-    "".to_string()
+    code
 }
 
 #[cfg(test)]
@@ -307,6 +411,6 @@ mod tests{
         }
 
 
-        _ = order_variable_locations(&mut variables, aarch64_regs, instructions, &mut stack_offset);
+        println!("{}", order_variable_locations(&mut variables, aarch64_regs, instructions, &mut stack_offset));
     }
 }
