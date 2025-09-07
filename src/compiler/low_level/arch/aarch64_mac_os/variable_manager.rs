@@ -256,7 +256,13 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
             if least_costy_position.is_none() { continue; }
             let least_costy_position = least_costy_position.unwrap();
             if !matches!(least_costy_position, DataPosition::Register(_)) {
-                // TODO: Update location in "variables"
+                // Update the positions in variables.
+                // Up to now, the "variables" variable still has the old position.
+                // As those positions are now outdated, they should be overwritten.
+                // This happens by first "retracing" the position in said variable, ...
+                let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
+                // ... and then changing it right there
+                variables[position_in_variables].positions = stack_variable.positions.clone();
                 continue;
             }
 
