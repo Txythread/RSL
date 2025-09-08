@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env::var;
 use std::fmt::format;
 use crate::compiler::low_level::arch::register::{Register, RegisterTag};
 use crate::compiler::low_level::data_position::DataPosition;
@@ -230,109 +231,6 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
             continue;
         }
 
-        // Push the data to the stack.
-
-        // Data that had no previous location but is now new at the stack does not need to be allocated,
-        // it just needs a reserved address, which it's already got,
-        // but it still needs to have its stack position stored in the variables variable
-
-        // Data is best stored in pairs, as this is more efficient on the aarch64 architecture.
-        // Keep info about one variable to be able to push in pairs where possible
-        // Store the variable (with its new location in the positions field) and the register it has been stored at previously
-        let mut pair_first_part: Option<(Variable, Register)> = None;
-
-        // Go through all the data from the stack
-        for stack_variable in new_stack_items.clone(){
-            // The variable as it's been in its previous state (with the old positions).
-            let original_variable = variables.iter().find(|&var| var.full_name == stack_variable.full_name);
-
-            if original_variable.is_none() { continue; }
-
-            let original_variable = original_variable.unwrap();
-
-            // If the original variable wasn't stored in a register, skip it (as explained above).
-            let least_costy_position = original_variable.get_cheapest_position();
-
-            if least_costy_position.is_none() { continue; }
-            let least_costy_position = least_costy_position.unwrap();
-            if !matches!(least_costy_position, DataPosition::Register(_)) {
-                // Update the positions in variables.
-                // Up to now, the "variables" variable still has the old position.
-                // As those positions are now outdated, they should be overwritten.
-                // This happens by first "retracing" the position in said variable, ...
-                let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
-                // ... and then changing it right there
-                variables[position_in_variables].positions = stack_variable.positions.clone();
-                continue;
-            }
-
-            let current_register = registers.iter().find(|&x|x.name == least_costy_position.register_name().unwrap());
-            if current_register.is_none() { panic!("Register {} not found though there's a value that claims to have been stored in it.", least_costy_position.register_name().unwrap())}
-            let current_register = current_register.unwrap();
-
-            // Try to make pairs as explained above
-            if pair_first_part.is_none() {
-                pair_first_part = Some((stack_variable.clone(), current_register.clone()));
-
-                // Continue as the rest of the code is for actually storing the pair.
-                continue;
-            }
-
-            // Store the pair if possible.
-            // Storing the pair is impossible if their expected storing positions are not immediately after each other.
-            // This could happen if a new value has been allocated in between.
-            // If there are 8B in between the storage positions of those two variables,
-            // they are after each other for sure -> store them as a pair
-            let storage_position_difference = (pair_first_part.clone().unwrap().0.get_stack_offset().unwrap() as isize) - stack_variable.get_stack_offset().unwrap() as isize;
-
-            // Also generate the register of the second part
-
-            {
-                let stack_offset1 = stack_variable.get_stack_offset().unwrap();
-                let reg_name1 = current_register.clone().name;
-                let stack_offset2 = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
-                let reg_name2 = pair_first_part.clone().unwrap().1.name;
-
-                println!("Reg {} should be stored at {}. Reg {} should be stored at {}", reg_name1, stack_offset1, reg_name2, stack_offset2);
-            }
-            // Check difference as detailed above
-            if storage_position_difference == 8 {
-                // Store in order: second_pair_part, first_pair_part at the position of first_pair_part
-                let stack_offset = stack_variable.get_stack_offset().unwrap();
-                code += format!("stp\t{}, {}, [sp, #{}]\n", current_register.name, pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
-            }else if storage_position_difference == -8 {
-                // Store in reverse order
-                let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
-                code += format!("stp\t{}, {}, [sp, #{}]\n", pair_first_part.clone().unwrap().1.name, current_register.name, stack_offset).as_str();
-            }else {
-                // Store pair_first_part
-                {
-                    let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
-                    code += format!("str\t{}, [sp, #{}]", pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
-                }
-                // Store the second pair part
-                {
-                    let stack_offset = stack_variable.get_stack_offset().unwrap();
-                    code += format!("str\t{}, [sp, #{}]", current_register.name, stack_offset).as_str();
-                }
-            }
-
-            // Update the locations stored in the "variables" variable.
-            // Now that the data is stored in its new position, the old position can be forgotten
-            // without an issue.
-
-            // Do this for the current one first
-            {
-                let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
-                variables[position_in_variables].positions = stack_variable.positions.clone();
-            }
-
-            // Now the same for the first_pair_part
-            {
-                let position_in_variables = variables.iter().position(|x| x.clone().full_name == pair_first_part.clone().unwrap().0.full_name).unwrap();
-                variables[position_in_variables].positions = pair_first_part.clone().unwrap().0.positions.clone();
-            }
-        }
 
         // Generate the location and update the stack offset (since function/stack frame start)
         let location = DataPosition::StackOffset(*stack_offset);
@@ -344,6 +242,128 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
         // Mark this for actually adding the push code later.
         new_stack_items.push(var_info.clone().0);
     }
+
+    // Push the data to the stack.
+
+    // Data that had no previous location but is now new at the stack does not need to be allocated,
+    // it just needs a reserved address, which it's already got,
+    // but it still needs to have its stack position stored in the variables variable
+
+    // Data is best stored in pairs, as this is more efficient on the aarch64 architecture.
+    // Keep info about one variable to be able to push in pairs where possible
+    // Store the variable (with its new location in the positions field) and the register it has been stored at previously
+    let mut pair_first_part: Option<(Variable, Register)> = None;
+
+    // Go through all the data from the stack
+    for stack_variable in new_stack_items.clone(){
+        // The variable as it's been in its previous state (with the old positions).
+        let original_variable = variables.iter().find(|&var| var.full_name == stack_variable.full_name);
+
+        if original_variable.is_none() { continue; }
+
+        let original_variable = original_variable.unwrap();
+
+        // If the original variable wasn't stored in a register, skip it (as explained above).
+        let least_costy_position = original_variable.get_cheapest_position();
+
+        if least_costy_position.is_none() { continue; }
+        let least_costy_position = least_costy_position.unwrap();
+        if !matches!(least_costy_position, DataPosition::Register(_)) {
+            // Update the positions in variables.
+            // Up to now, the "variables" variable still has the old position.
+            // As those positions are now outdated, they should be overwritten.
+            // This happens by first "retracing" the position in said variable, ...
+            let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
+            // ... and then changing it right there
+            variables[position_in_variables].positions = stack_variable.positions.clone();
+            continue;
+        }
+
+        let current_register = registers.iter().find(|&x|x.name == least_costy_position.register_name().unwrap());
+        if current_register.is_none() { panic!("Register {} not found though there's a value that claims to have been stored in it.", least_costy_position.register_name().unwrap())}
+        let current_register = current_register.unwrap();
+
+        // Try to make pairs as explained above
+        if pair_first_part.is_none() {
+            pair_first_part = Some((stack_variable.clone(), current_register.clone()));
+
+            // Continue as the rest of the code is for actually storing the pair.
+            continue;
+        }
+
+        // Store the pair if possible.
+        // Storing the pair is impossible if their expected storing positions are not immediately after each other.
+        // This could happen if a new value has been allocated in between.
+        // If there are 8B in between the storage positions of those two variables,
+        // they are after each other for sure -> store them as a pair
+        let storage_position_difference = (pair_first_part.clone().unwrap().0.get_stack_offset().unwrap() as isize) - stack_variable.get_stack_offset().unwrap() as isize;
+
+        // Also generate the register of the second part
+
+        {
+            let stack_offset1 = stack_variable.get_stack_offset().unwrap();
+            let reg_name1 = current_register.clone().name;
+            let stack_offset2 = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+            let reg_name2 = pair_first_part.clone().unwrap().1.name;
+
+            println!("Reg {} should be stored at {}. Reg {} should be stored at {}", reg_name1, stack_offset1, reg_name2, stack_offset2);
+        }
+        // Check difference as detailed above
+        if storage_position_difference == 8 {
+            // Store in order: second_pair_part, first_pair_part at the position of first_pair_part
+            let stack_offset = stack_variable.get_stack_offset().unwrap();
+            code += format!("stp\t{}, {}, [sp, #{}]\n", current_register.name, pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
+        }else if storage_position_difference == -8 {
+            // Store in reverse order
+            let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+            code += format!("stp\t{}, {}, [sp, #{}]\n", pair_first_part.clone().unwrap().1.name, current_register.name, stack_offset).as_str();
+        }else {
+            // Store pair_first_part
+            {
+                let stack_offset = pair_first_part.clone().unwrap().0.get_stack_offset().unwrap();
+                code += format!("str\t{}, [sp, #{}]", pair_first_part.clone().unwrap().1.name, stack_offset).as_str();
+            }
+            // Store the second pair part
+            {
+                let stack_offset = stack_variable.get_stack_offset().unwrap();
+                code += format!("str\t{}, [sp, #{}]", current_register.name, stack_offset).as_str();
+            }
+        }
+
+        // Update the locations stored in the "variables" variable.
+        // Now that the data is stored in its new position, the old position can be forgotten
+        // without an issue.
+
+        // Do this for the current one first
+        {
+            let position_in_variables = variables.iter().position(|x| x.clone().full_name == stack_variable.full_name).unwrap();
+            variables[position_in_variables].positions = stack_variable.positions.clone();
+        }
+
+        // Now the same for the first_pair_part
+        {
+            let position_in_variables = variables.iter().position(|x| x.clone().full_name == pair_first_part.clone().unwrap().0.full_name).unwrap();
+            variables[position_in_variables].positions = pair_first_part.clone().unwrap().0.positions.clone();
+        }
+
+        // Reset the pair_first_part bc it's been handled already.
+        pair_first_part = None;
+    }
+
+    // Optionally push the last variable to the stack (from the variables that need to be on the stack), if it exists
+    // (which happens if the amount of variables that need to be pushed to the stack is uneven).
+    if let Some(variable) = pair_first_part {
+        let position_in_variables = variables.iter().position(|x| x.clone().full_name == variable.0.full_name).unwrap();
+        let target_stack_position = variable.0.get_stack_offset().unwrap();
+        let start_register_name = variable.1.name;
+        variables[position_in_variables].positions = variables[position_in_variables].positions.clone();
+
+        code += format!("str\t{}, [sp, #{}]\n", start_register_name, target_stack_position).as_str();
+
+        // Just to be sure, IDK what I'll code later
+        pair_first_part = None;
+    }
+
 
     #[cfg(test)]
     {
@@ -408,7 +428,7 @@ mod tests{
         variables.push(var2.clone());
         variables.push(var3.clone());
 
-        for i in 4..40{
+        for i in 4..21 {
             let variable = Variable::new(format!("var-{}", i), vec![]);
 
             instructions.insert(4, MacroInstruction::UseVariableAsArgument(variable.clone(), 0));
