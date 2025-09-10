@@ -1,7 +1,7 @@
 use crate::compiler::low_level::data_position::DataPosition::Register;
 
 /// Holds all the possible locations data could be at during the runtime of the compiled program
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DataPosition{
     Register(/*name: */String),
     StackOffset(/*offset:*/usize),

@@ -1,3 +1,4 @@
+use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::env::var;
 use std::fmt::format;
@@ -365,22 +366,118 @@ pub fn order_variable_locations(variables: &mut Vec<Variable>, registers: Vec<Re
     }
 
 
-    #[cfg(test)]
-    {
-        for reg_and_var in register_to_variable_map {
-            println!("Register {}: \t{}", reg_and_var.0.name, reg_and_var.1.full_name);
+    // Find the discrepancy between the variables stored in registers.
+    // Ignore all the variables that should remain in the same position and the ones that
+    // have been stored to the stack.
+    // Only the original register and the target register need to be stored, everything else can be discarded
+    let mut changed_variables: Vec<(Register, Register)> = Vec::new();
+
+    // The variables that are currently on stack but need to be stored in a register.
+    // This stores both stack offset (in frame) and the target register.
+    let mut variables_from_stack: Vec<(usize, Register)> = Vec::new();
+
+    for i in register_to_variable_map {
+        let variable = i.1.clone();
+        let current_position = variable.get_cheapest_position();
+        let target_register = i.0.clone();
+
+        let target_position = DataPosition::Register(target_register.clone().name);
+
+        if current_position == Some(target_position) {
+            // The variable is in its target position already,
+            // no further action required
+            continue;
         }
-        for stack_data in new_stack_items{
-            println!("Adding {} to stack.", stack_data.full_name)
+
+        // The target position is both:
+        // * a register
+        // * not the original position
+
+        // Look if the original position exists, if not, there is no further action required
+        // as the space is already reserved.
+        if current_position.is_none() { continue; }
+        let current_position = current_position.unwrap();
+
+        // Check if the variable is currently in the stack or in a register
+        if let Some(current_stack_offset) = current_position.immediate_stack_offset(){
+            // It's currently on the stack but needs to be in a register.
+            // Append it to the array to take care of it later.
+            variables_from_stack.push((current_stack_offset, target_register.clone()));
+            continue;
+        }
+
+        // It's currently in register but needs to be in another register.
+
+        let current_register = registers.iter().find(|&x|x.name == variable.get_cheapest_position().unwrap().register_name().unwrap()).unwrap().clone();
+
+        changed_variables.push((current_register, target_register.clone()));
+    }
+
+    /// Generate assembly for changing the position of a variable from one register to another (and do so recursively if there's still data on the "target register").
+    /// When "max iterations" is reached, the data is stored in a scratch register instead.
+    fn recursively_move_registers(changed_variables: &mut Vec<(Register, Register)>, all_variables: &mut Vec<Variable>, pos_in_changed_vars: usize, code: &mut String, registers: Vec<Register>) {
+        let current_variable = changed_variables[pos_in_changed_vars].clone();
+        let current_variable_current_pos = current_variable.0;
+        let current_variable_target_pos = current_variable.1;
+
+        println!("Finding variable from {}", current_variable_current_pos.name.clone());
+        let current_variable_pos_in_changed_variables = changed_variables.iter().position(|x| x.clone().0.name == current_variable_current_pos.name).unwrap();
+        let current_variable_pos_in_variables = all_variables.iter().position(|x|x.clone().get_cheapest_position().unwrap().register_name().unwrap() == current_variable_current_pos.name).unwrap();
+
+        // Find data that is stored in the target register.
+        // This would mean the other variable's current position is the same as this variable's target position.
+        let annoying_variable = changed_variables.iter().find(|&x| x.clone().0.name == current_variable_target_pos.name);
+
+        // In case the annoying variable doesn't exist,
+        // the contents of the (target) register can just be overwritten ruthlessly.
+        if annoying_variable.is_none() {
+            // Just generate assembly for pushing
+            *code += format!("mov\t{}, {}\n", current_variable_target_pos.name, current_variable_current_pos.name).as_str();
+
+            // Remove the variable from the list of changed variables
+            changed_variables.remove(current_variable_pos_in_changed_variables);
+            let current_variable_pos_in_variables = all_variables.iter().position(|x|x.clone().get_cheapest_position().unwrap().register_name().unwrap() == current_variable_current_pos.name).unwrap();
+            all_variables[current_variable_pos_in_variables].positions = vec![DataPosition::Register(current_variable_target_pos.name)];
+            return;
+        }
+
+        let annoying_variable = annoying_variable.unwrap().clone();
+        let annoying_variable_pos_in_changed_variables = changed_variables.iter().position(|x| x.clone().0.name == annoying_variable.0.name).unwrap();
+        let annoying_variable_pos_in_variables = changed_variables.iter().position(|x| x.clone().0.name == annoying_variable.0.name).unwrap();
+
+        // If the scratch register contains no (relevant) data right now,
+        // overwrite it with the annoying variable.
+        // Moving it to its actual target happens in later iterations.
+        let scratch_register = registers.iter().find(|&x|x.clone().tags.contains(&RegisterTag::Scratch)).unwrap();
+        let scratch_register_name = scratch_register.name.clone();
+        let scratch_register_empty = changed_variables.iter().find(|&x| x.clone().0.name == scratch_register_name).is_none();
+
+
+        if scratch_register_empty {
+            // Move the other variable to the scratch register
+            changed_variables[annoying_variable_pos_in_changed_variables].0 = scratch_register.clone();
+            all_variables[annoying_variable_pos_in_variables].positions = vec![DataPosition::Register(scratch_register_name.clone())];
+            *code += format!("mov\t{}, {}\n", scratch_register_name, annoying_variable.0.name).as_str();
+            // Move the current variable to its destination
+            all_variables[current_variable_pos_in_variables].positions = all_variables[current_variable_pos_in_variables].positions.clone();
+            changed_variables.remove(current_variable_pos_in_changed_variables);
+            *code += format!("mov\t{}, {}\n", current_variable_target_pos.name, current_variable_current_pos.name).as_str();
         }
     }
 
 
+    #[cfg(test)]
+    for i in 0..variables.len(){
+        println!("variables[{}] = (name: {}, current-pos: {:?})", i, variables[i].full_name, variables[i].get_cheapest_position());
+    }
 
-    // Look which stack items need to be allocated.
-    // Stack items without
-
-    // TODO: Generate discrepancy, create code for creating assembly for pushing variables around
+    // TODO: The upper method must be executed in a WHILE loop until the changed variables variable reaches zero
+    let mut i: usize = 0;
+    while changed_variables.len() > 0 {
+        let changed_variables_length = changed_variables.len();
+        recursively_move_registers(&mut changed_variables, &mut *variables, i % changed_variables_length, &mut code, registers.clone());
+        i += 1;
+    }
 
     code
 }
@@ -390,6 +487,7 @@ mod tests{
     use crate::compiler::low_level::arch::aarch64_mac_os::aarch64_mac_os::AArch64MacOs;
     use crate::compiler::low_level::arch::aarch64_mac_os::variable_manager::order_variable_locations;
     use crate::compiler::low_level::arch::register::RegisterSaver;
+    use crate::compiler::low_level::data_position::DataPosition;
     use crate::compiler::low_level::data_position::DataPosition::Register;
     use crate::compiler::low_level::macro_instruction::MacroInstruction;
     use crate::compiler::low_level::variable::Variable;
@@ -436,6 +534,26 @@ mod tests{
             variables.push(variable.clone());
         }
 
+
+        println!("{}", order_variable_locations(&mut variables, aarch64_regs, instructions, &mut stack_offset));
+    }
+
+    #[test]
+    fn other_test(){
+        let mut aarch64 = AArch64MacOs::new();
+        let aarch64_regs = aarch64.registers;
+
+        let var_1 = Variable::new("var-1".to_string(), vec![DataPosition::Register("x0".to_string())]);
+        let var_2 = Variable::new("var-2".to_string(), vec![DataPosition::Register("x1".to_string())]);
+
+        let mut instructions: Vec<MacroInstruction> = vec![
+            MacroInstruction::UseVariableAsArgument(var_2.clone(), 0),
+            MacroInstruction::UseVariableAsArgument(var_1.clone(), 1),
+            MacroInstruction::CallFunction("_malloc".to_string(), 2),
+        ];
+
+        let mut variables: Vec<Variable> = vec![var_1.clone(), var_2.clone()];
+        let mut stack_offset: usize = 0;
 
         println!("{}", order_variable_locations(&mut variables, aarch64_regs, instructions, &mut stack_offset));
     }
